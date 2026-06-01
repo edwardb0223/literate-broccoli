@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+SOC Log Analyzer
+================
+Parses Linux auth logs and Windows event-style logs to detect:
+  - Brute force / failed login attempts
+  - Successful logins after failures (credential compromise indicator)
+  - Off-hours login activity
+  - New user account creation
+  - Privilege escalation attempts (sudo)
+
+Author : Edward Brown
+Purpose: Entry-level SOC portfolio — demonstrating log analysis & threat detection
+"""
+
+import re
+import json
+import argparse
+from datetime import datetime, time
+from collections import defaultdict
+from pathlib import Path
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
+BRUTE_FORCE_THRESHOLD = 5       # failed attempts before flagging
+OFF_HOURS_START       = time(20, 0)   # 8 PM
+OFF_HOURS_END         = time(6, 0)    # 6 AM
+SUSPICIOUS_USERS      = {"root", "admin", "administrator", "test", "guest"}
+
+# ── Regex patterns ────────────────────────────────────────────────────────────
+PATTERNS = {
+    "failed_login": re.compile(
+        r"(\w{3}\s+\d+\s[\d:]+).*Failed password for (?:invalid user )?(\S+) from ([\d.]+)"
+    ),
+    "successful_login": re.compile(
+        r"(\w{3}\s+\d+\s[\d:]+).*Accepted (?:password|publickey) for (\S+) from ([\d.]+)"
+    ),
+    "new_user": re.compile(
+        r"(\w{3}\s+\d+\s[\d:]+).*new user: name=(\S+)"
+    ),
+    "sudo_attempt": re.compile(
+        r"(\w{3}\s+\d+\s[\d:]+).*sudo:.*USER=(\S+).*COMMAND=(.*)"
+    ),
+    "account_lockout": re.compile(
+        r"(\w{3}\s+\d+\s[\d:]+).*pam_unix.*authentication failure.*user=(\S+)"
+    ),
+}
+
+
+def parse_timestamp(ts_str: str) -> datetime | None:
+    """Parse syslog-style timestamps."""
+    try:
+        year = datetime.now().year
+        return datetime.strptime(f"{year} {ts_str.strip()}", "%Y %b %d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def is_off_hours(dt: datetime) -> bool:
+    """Return True if datetime falls outside business hours."""
+    t = dt.time()
+    if OFF_HOURS_START <= OFF_HOURS_END:
+        return OFF_HOURS_START <= t <= OFF_HOURS_END
+    return t >= OFF_HOURS_START or t <= OFF_HOURS_END
+
+
+class LogAnalyzer:
+    def __init__(self):
+        self.failed_logins:    defaultdict = defaultdict(list)   # ip -> [timestamps]
+        self.successful_logins: list       = []
+        self.alerts:           list        = []
+        self.stats:            dict        = defaultdict(int)
+
+    # ── Ingestion ─────────────────────────────────────────────────────────────
+    def analyze_line(self, line: str) -> None:
+        self.stats["lines_processed"] += 1
+
+        for event_type, pattern in PATTERNS.items():
+            match = pattern.search(line)
+            if not match:
+                continue
+            self.stats[event_type] += 1
+            self._dispatch(event_type, match)
+
+    def _dispatch(self, event_type: str, match: re.Match) -> None:
+        groups = match.groups()
+        ts_raw = groups[0]
+        dt     = parse_timestamp(ts_raw)
+
+        if event_type == "failed_login":
+            user, ip = groups[1], groups[2]
+            self.failed_logins[ip].append({"time": ts_raw, "user": user, "dt": dt})
+            self._check_brute_force(ip, user)
+            if user in SUSPICIOUS_USERS:
+                self._add_alert("HIGH", "Suspicious username targeted",
+                                f"Failed login for privileged account '{user}' from {ip}", dt)
+
+        elif event_type == "successful_login":
+            user, ip = groups[1], groups[2]
+            self.successful_logins.append({"time": ts_raw, "user": user, "ip": ip, "dt": dt})
+            self._check_success_after_failure(ip, user, dt)
+            if dt and is_off_hours(dt):
+                self._add_alert("MEDIUM", "Off-hours login",
+                                f"Successful login for '{user}' from {ip} at {ts_raw}", dt)
+
+        elif event_type == "new_user":
+            user = groups[1]
+            self._add_alert("HIGH", "New user account created",
+                            f"Account '{user}' created at {ts_raw}", dt)
+
+        elif event_type == "sudo_attempt":
+            user, command = groups[1], groups[2]
+            self._add_alert("MEDIUM", "Privilege escalation via sudo",
+                            f"User '{user}' ran sudo: {command.strip()} at {ts_raw}", dt)
+
+        elif event_type == "account_lockout":
+            user = groups[1]
+            self._add_alert("LOW", "Account lockout / PAM failure",
+                            f"Authentication failure for '{user}' at {ts_raw}", dt)
+
+    # ── Detection logic ───────────────────────────────────────────────────────
+    def _check_brute_force(self, ip: str, user: str) -> None:
+        attempts = self.failed_logins[ip]
+        if len(attempts) == BRUTE_FORCE_THRESHOLD:
+            self._add_alert(
+                "HIGH", "Brute force detected",
+                f"{len(attempts)} failed login attempts from {ip} "
+                f"(latest target: '{user}')",
+                attempts[-1]["dt"]
+            )
+
+    def _check_success_after_failure(self, ip: str, user: str, dt: datetime | None) -> None:
+        if ip in self.failed_logins and self.failed_logins[ip]:
+            fail_count = len(self.failed_logins[ip])
+            self._add_alert(
+                "CRITICAL", "Successful login after failures",
+                f"'{user}' logged in successfully from {ip} after "
+                f"{fail_count} failed attempt(s) — possible credential compromise",
+                dt
+            )
+
+    def _add_alert(self, severity: str, title: str, detail: str,
+                   dt: datetime | None) -> None:
+        self.alerts.append({
+            "severity": severity,
+            "title":    title,
+            "detail":   detail,
+            "timestamp": dt.isoformat() if dt else "unknown",
+        })
+        self.stats[f"alerts_{severity.lower()}"] += 1
+
+    # ── Reporting ─────────────────────────────────────────────────────────────
+    def report(self) -> dict:
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        sorted_alerts  = sorted(self.alerts,
+                                key=lambda a: severity_order.get(a["severity"], 9))
+        return {
+            "summary":    dict(self.stats),
+            "alerts":     sorted_alerts,
+            "top_attackers": self._top_attackers(),
+        }
+
+    def _top_attackers(self) -> list:
+        ranked = sorted(self.failed_logins.items(),
+                        key=lambda kv: len(kv[1]), reverse=True)
+        return [{"ip": ip, "failed_attempts": len(attempts)}
+                for ip, attempts in ranked[:10]]
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+def print_report(report: dict) -> None:
+    SEV_COLOR = {
+        "CRITICAL": "\033[91m",   # red
+        "HIGH":     "\033[93m",   # yellow
+        "MEDIUM":   "\033[94m",   # blue
+        "LOW":      "\033[92m",   # green
+    }
+    RESET = "\033[0m"
+    BOLD  = "\033[1m"
+
+    print(f"\n{BOLD}═══ SOC LOG ANALYZER — REPORT ═══{RESET}\n")
+
+    print(f"{BOLD}SUMMARY{RESET}")
+    for k, v in report["summary"].items():
+        print(f"  {k:<30} {v}")
+
+    if report["top_attackers"]:
+        print(f"\n{BOLD}TOP ATTACKING IPs{RESET}")
+        for entry in report["top_attackers"]:
+            print(f"  {entry['ip']:<20} {entry['failed_attempts']} failed attempts")
+
+    print(f"\n{BOLD}ALERTS ({len(report['alerts'])} total){RESET}")
+    for alert in report["alerts"]:
+        color = SEV_COLOR.get(alert["severity"], "")
+        print(f"\n  {color}[{alert['severity']}]{RESET} {alert['title']}")
+        print(f"  {alert['detail']}")
+        print(f"  Time: {alert['timestamp']}")
+
+
+def generate_sample_log(path: Path) -> None:
+    """Write a realistic sample auth.log for testing."""
+    sample = """Jan 15 02:14:01 server sshd[1234]: Failed password for root from 192.168.1.50 port 22 ssh2
+Jan 15 02:14:03 server sshd[1234]: Failed password for root from 192.168.1.50 port 22 ssh2
+Jan 15 02:14:05 server sshd[1234]: Failed password for root from 192.168.1.50 port 22 ssh2
+Jan 15 02:14:07 server sshd[1234]: Failed password for root from 192.168.1.50 port 22 ssh2
+Jan 15 02:14:09 server sshd[1234]: Failed password for root from 192.168.1.50 port 22 ssh2
+Jan 15 02:14:11 server sshd[1234]: Accepted password for root from 192.168.1.50 port 22 ssh2
+Jan 15 08:30:00 server sshd[2000]: Accepted password for edward from 10.0.0.5 port 22 ssh2
+Jan 15 22:45:00 server sshd[3000]: Accepted password for jsmith from 203.0.113.42 port 22 ssh2
+Jan 15 10:00:00 server useradd[4000]: new user: name=backdoor uid=1001 gid=1001
+Jan 15 10:05:00 server sudo: jsmith : USER=root ; COMMAND=/bin/bash
+Jan 15 11:00:00 server sshd[5000]: Failed password for invalid user test from 10.10.10.10 port 22 ssh2
+Jan 15 11:01:00 server sshd[5001]: Failed password for admin from 198.51.100.7 port 22 ssh2
+Jan 15 11:02:00 server sshd[5002]: Failed password for admin from 198.51.100.7 port 22 ssh2
+Jan 15 11:03:00 server sshd[5003]: Failed password for admin from 198.51.100.7 port 22 ssh2
+"""
+    path.write_text(sample)
+    print(f"Sample log written to {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SOC Log Analyzer — detects threats in auth logs"
+    )
+    parser.add_argument("logfile", nargs="?", help="Path to auth.log (omit to use sample)")
+    parser.add_argument("--json", action="store_true", help="Output JSON instead of text")
+    parser.add_argument("--sample", action="store_true", help="Generate sample log and analyze it")
+    args = parser.parse_args()
+
+    if args.sample or not args.logfile:
+        sample_path = Path("sample_auth.log")
+        generate_sample_log(sample_path)
+        log_path = sample_path
+    else:
+        log_path = Path(args.logfile)
+
+    if not log_path.exists():
+        print(f"Error: {log_path} not found.")
+        return
+
+    analyzer = LogAnalyzer()
+    with log_path.open() as f:
+        for line in f:
+            analyzer.analyze_line(line)
+
+    report = analyzer.report()
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report)
+
+
+if __name__ == "__main__":
+    main()

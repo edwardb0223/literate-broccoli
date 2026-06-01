@@ -1,6 +1,0 @@
-cd soc-analyst-portfolio
-git init
-git add .
-git commit -m "Initial commit: SOC analyst portfolio"
-git remote add origin https://github.com/yourusername/soc-analyst-portfolio.git
-git push -u origin main
